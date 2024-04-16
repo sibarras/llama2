@@ -2,9 +2,12 @@
 # Port from C to Mojo
 
 
-@value
 @register_passable
 struct Config:
+    alias VAR_COUNT = 7
+    alias type = Int32
+    alias SIZE = Self.VAR_COUNT * sizeof[Self.type]()
+
     var dim: Int
     var hidden_dim: Int
     var n_layers: Int
@@ -13,21 +16,93 @@ struct Config:
     var vocab_size: Int
     var seq_len: Int
 
+    var head_size: Int
+    var kv_dim: Int
+    var kv_mul: Int
 
-@value
+    fn __init__(inout self, inout file_handle: FileHandle) raises:
+        """Assume that the file contains all information in binary format contiguous in memory.
+        """
+        var raw_data = file_handle.read_bytes(Config.SIZE)
+        var config = Tensor(raw_data).astype[DType.int32]()
+
+        # Vocab size will be negative if we are using shared weights
+        self.dim = config[0].to_int()
+        self.hidden_dim = config[1].to_int()
+        self.n_layers = config[2].to_int()
+        self.n_heads = config[3].to_int()
+        self.n_kv_heads = config[4].to_int()
+        self.vocab_size = (
+            config[5].to_int() if config[5].to_int() > 0 else -config[5].to_int()
+        )
+        self.seq_len = config[6].to_int()
+
+        # Calculated values
+        self.head_size = self.dim // self.n_heads
+        self.kv_dim = (self.dim * self.n_kv_heads) // self.n_heads
+        self.kv_mul = self.n_heads // self.n_kv_heads
+
+
+from tensor import TensorShape
+
+
+fn read_weights(inout f: FileHandle, inout readed: Int, *dims: Int) raises -> TensorF32:
+    var shape = TensorShape(dims)
+    var raw = f.read_bytes(shape.num_elements() * sizeof[DType.float32]())
+    readed += shape.num_elements() * sizeof[DType.float32]()
+    var tensor = Tensor(raw).astype[DType.float32]()
+    var final_tensor = tensor.reshape(shape)
+    return final_tensor
+
+
 struct TransformerWeights:
-    var token_embedding_table: TensorF32
-    var rms_att_weight: TensorF32
-    var rms_ffn_weight: TensorF32
-    var wq: TensorF32
-    var wk: TensorF32
-    var wv: TensorF32
-    var wo: TensorF32
-    var w1: TensorF32
-    var w2: TensorF32
-    var w3: TensorF32
-    var rms_final_weight: TensorF32
-    var wcls: TensorF32
+    alias type = DType.float32
+    var token_embedding_table: Tensor[Self.type]
+    var rms_att_weight: Tensor[Self.type]
+    var rms_ffn_weight: Tensor[Self.type]
+    var wq: Tensor[Self.type]
+    var wk: Tensor[Self.type]
+    var wv: Tensor[Self.type]
+    var wo: Tensor[Self.type]
+    var w1: Tensor[Self.type]
+    var w2: Tensor[Self.type]
+    var w3: Tensor[Self.type]
+    var rms_final_weight: Tensor[Self.type]
+    var wcls: Tensor[Self.type]
+
+    fn __init__(inout self, inout file: FileHandle, config: Config) raises:
+        var readed = Config.SIZE
+        self.token_embedding_table = read_weights(
+            file, readed, config.vocab_size, config.dim
+        )
+        self.rms_att_weight = read_weights(file, readed, config.n_layers, config.dim)
+        self.wq = read_weights(file, readed, config.n_layers, config.dim, config.dim)
+        self.wk = read_weights(file, readed, config.n_layers, config.kv_dim, config.dim)
+        self.wv = read_weights(file, readed, config.n_layers, config.kv_dim, config.dim)
+        self.wo = read_weights(file, readed, config.n_layers, config.dim, config.dim)
+        self.rms_ffn_weight = read_weights(file, readed, config.n_layers, config.dim)
+        self.w1 = read_weights(
+            file, readed, config.n_layers, config.hidden_dim, config.dim
+        )
+        self.w2 = read_weights(
+            file, readed, config.n_layers, config.dim, config.hidden_dim
+        )
+        self.w3 = read_weights(
+            file, readed, config.n_layers, config.hidden_dim, config.dim
+        )
+        self.rms_final_weight = read_weights(file, readed, config.dim)
+        _ = file.read_bytes(config.seq_len * config.head_size / 2)
+        _ = file.read_bytes(config.seq_len * config.head_size / 2)
+        self.wcls = read_weights(file, readed, config.dim, config.vocab_size)
+        print("readed:", readed, ". Checkpoint size: ", readed // 1024 // 1024, "MB")
+
+
+fn foo[T: AnyRegType]() -> None:
+    ...
+
+
+fn m():
+    foo[TensorF32]()
 
 
 from tensor import Tensor
@@ -71,7 +146,6 @@ struct RunState:
         self.v = None
 
 
-@value
 struct Transformer:
     var config: Config
     var weights: TransformerWeights
@@ -89,6 +163,38 @@ struct Mode:
 
     fn __init__(inout self, value: StringLiteral):
         self._value = value
+
+
+struct TokenIndex:
+    var name: String
+    var id: Int
+
+
+struct Tokenizer:
+    var vocab: String
+    var vocab_scores: Float32
+    var sorted_vocab: TokenIndex
+    var vocab_size: Int
+    var max_token_length: UInt32
+    var byte_pieces: SIMD[DType.uint8, 512]
+
+    fn __init__[
+        path: PathLike
+    ](inout self, tokenizer_path: path, vocab_size: Int) raises:
+        self.vocab_size = vocab_size
+
+        self.byte_pieces = SIMD[DType.uint8, 512]()
+        for i in range(512):
+            self.byte_pieces[i] = ord(str(i))
+            self.byte_pieces[i + 1] = ord("\0")
+
+        with open(tokenizer_path, "rb") as f:
+            var tk_len = f.read_bytes(sizeof[UInt32]())
+            # self.max_token_length = tk_len.data.v
+            # self.vocab = f.read()
+            # self.vocab_scores = f.read()
+            # self.sorted_vocab = f.read()
+            # self.max_token_length = f.read(
 
 
 from sys import argv
@@ -130,6 +236,16 @@ fn cast_to_int(string: String) -> Optional[Int]:
         return Optional(atol(string))
     except:
         return None
+
+
+# fn read_config(file: String) raises -> Tuple[Config, TransformerWeights]:
+#     var conf: Config
+#     var weights: TransformerWeights
+#     with open(file, 'rb') as f:
+#         conf = f
+#         weights = TransformerWeights(f, conf)
+
+#     return conf, weights
 
 
 fn main():
@@ -236,12 +352,28 @@ fn main():
         steps = 0 if steps < 0 else steps
 
         # Build the transformer via model .bin file
+        var model_path: String
+        if checkpoint_path:
+            model_path = checkpoint_path.value()
+        else:
+            print("Error: Model path was provided.")
+            return
+
+        var config: Config
+        var weights: TransformerWeights
+        try:
+            with open(model_path, "rb") as f:
+                config = f
+                weights = TransformerWeights(f, config)
+        except:
+            print("Error: Not able to read the model .bin file.", model_path)
+            return
 
         # Build the tokenizer via tokenizer .bin file
+        var tokenizer: Tokenizer
 
         # Build the sampler
 
         # Run
 
         # Memory and file handles cleanup
-
