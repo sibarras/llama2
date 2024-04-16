@@ -171,8 +171,8 @@ struct TokenIndex:
 
 
 struct Tokenizer:
-    var vocab: String
-    var vocab_scores: Float32
+    var vocab: List[String]
+    var vocab_scores: List[Float32]
     var sorted_vocab: TokenIndex
     var vocab_size: Int
     var max_token_length: UInt32
@@ -182,6 +182,11 @@ struct Tokenizer:
         path: PathLike
     ](inout self, tokenizer_path: path, vocab_size: Int) raises:
         self.vocab_size = vocab_size
+        self.vocab = List[String]()
+        self.vocab_scores = List[Float32]()
+        # self.vocab = List[UInt8]()
+        # self.vocab.resize(self.vocab_size, 0)
+
 
         self.byte_pieces = SIMD[DType.uint8, 512]()
         for i in range(512):
@@ -189,8 +194,9 @@ struct Tokenizer:
             self.byte_pieces[i + 1] = ord("\0")
 
         with open(tokenizer_path, "rb") as f:
-            var tk_len = f.read_bytes(sizeof[UInt32]())
-            # self.max_token_length = tk_len.data.v
+            self.max_token_length = f.read_bytes(sizeof[UInt32]()).data.bitcast[UInt32]().take_value()
+            self.max_token_length = UInt32()
+            self.max_token_length.value = 
             # self.vocab = f.read()
             # self.vocab_scores = f.read()
             # self.sorted_vocab = f.read()
